@@ -9,24 +9,20 @@ import android.content.Context
 import android.os.Bundle
 import android.text.TextUtils
 import android.util.DisplayMetrics
-import android.view.KeyEvent
 import android.view.LayoutInflater
 import android.view.View
 import android.view.ViewGroup
 import android.view.accessibility.AccessibilityManager.TouchExplorationStateChangeListener
 import android.widget.FrameLayout
 import kotlinx.android.synthetic.main.fragment_browser.*
-import kotlinx.android.synthetic.main.fragment_browser.view.*
-import kotlinx.coroutines.experimental.CancellationException
 import org.mozilla.focus.R
-import org.mozilla.focus.UrlSearcher
 import org.mozilla.focus.browser.URLs.APP_STARTUP_HOME
 import org.mozilla.focus.ext.getAccessibilityManager
-import org.mozilla.focus.ext.isVisible
 import org.mozilla.focus.ext.isVoiceViewEnabled
 import org.mozilla.focus.ext.toUri
 import org.mozilla.focus.home.BundledTilesManager
 import org.mozilla.focus.home.CustomTilesManager
+import org.mozilla.focus.home.NavigationOverlayFragment
 import org.mozilla.focus.iwebview.IWebView
 import org.mozilla.focus.iwebview.IWebViewLifecycleFragment
 import org.mozilla.focus.session.NullSession
@@ -85,6 +81,8 @@ class BrowserFragment : IWebViewLifecycleFragment() {
     var onSessionProgressUpdate: ((value: Int) -> Unit)? = null
     private var touchExplorationStateChangeListener: TouchExplorationStateChangeListener? = null
 
+    val navigationOverlay = NavigationOverlayFragment.newInstance()
+
     /**
      * The current URL.
      *
@@ -98,7 +96,7 @@ class BrowserFragment : IWebViewLifecycleFragment() {
             // We prevent users from typing this URL in loadUrl but this will still be called for
             // the initial URL set in the Session.
             if (url == APP_STARTUP_HOME.toString()) {
-                homeScreen.visibility = View.VISIBLE
+                setNavigationOverlayIsVisible(true, isHomescreenOnStartup = true)
             }
 
             onUrlUpdate?.invoke(url) // This should be called last so app state is up-to-date.
@@ -107,7 +105,7 @@ class BrowserFragment : IWebViewLifecycleFragment() {
     // If the URL is startup home, the home screen should always be visible. For defensiveness, we
     // also check this condition. It's probably not necessary (it was originally added when the startup
     // url was the empty string which I was concerned the WebView could pass to us while loading).
-    private val isStartupHomepageVisible: Boolean get() = url == APP_STARTUP_HOME.toString() && homeScreen.isVisible
+    private val isStartupHomepageVisible: Boolean get() = url == APP_STARTUP_HOME.toString() && navigationOverlay.isVisible
 
     private val sessionManager = SessionManager.getInstance()
 
@@ -158,7 +156,8 @@ class BrowserFragment : IWebViewLifecycleFragment() {
             ToolbarEvent.RELOAD -> webView?.reload()
             ToolbarEvent.SETTINGS -> Unit // No Settings in BrowserFragment
             ToolbarEvent.PIN_ACTION -> this@BrowserFragment.url?.let { url -> onPinToolbarEvent(context, url, value) }
-            ToolbarEvent.HOME -> if (!homeScreen.isVisible) { homeScreen.setVisibilityWithAnimation(toShow = true)
+            ToolbarEvent.HOME -> if (!navigationOverlay.isVisible) {
+                setNavigationOverlayIsVisible(true)
             }
 
             ToolbarEvent.LOAD_URL -> throw IllegalStateException("Expected $event to be handled sooner")
@@ -171,7 +170,7 @@ class BrowserFragment : IWebViewLifecycleFragment() {
             ToolbarEvent.VAL_CHECKED -> {
                 CustomTilesManager.getInstance(context).pinSite(context, url,
                         webView?.takeScreenshot())
-                homeScreen.refreshTilesForInsertion()
+                navigationOverlay.refreshTilesForInsertion()
                 ToastManager.showPinnedToast(context)
             }
             ToolbarEvent.VAL_UNCHECKED -> {
@@ -181,7 +180,7 @@ class BrowserFragment : IWebViewLifecycleFragment() {
                     // tileId should never be null, unless, for some reason we don't
                     // have a reference to the tile/the tile isn't a Bundled or Custom tile
                     if (tileId != null && !tileId.isEmpty()) {
-                        homeScreen.removePinnedSiteFromTiles(tileId)
+                        navigationOverlay.removePinnedSiteFromTiles(tileId)
                         ToastManager.showUnpinnedToast(context)
                     }
                 }
@@ -193,24 +192,8 @@ class BrowserFragment : IWebViewLifecycleFragment() {
     override fun onCreateView(inflater: LayoutInflater, container: ViewGroup?, savedInstanceState: Bundle?): View {
         val layout = inflater.inflate(R.layout.fragment_browser, container, false)
 
-        with(layout.homeScreen) {
-            onTileClicked = { callbacks?.onNonTextInputUrlEntered(it) }
-            urlSearcher = activity as UrlSearcher
-            visibility = View.GONE
-            onPreSetVisibilityListener = { isHomeVisible ->
-                // It's a pre-set-visibility listener so we can't use toolbarStateProvider.isStartupHomePageVisible.
-                callbacks?.onHomeVisibilityChange(isHomeVisible, url == APP_STARTUP_HOME.toString())
-                updateWebViewVisibility(isVoiceViewEnabled = context.isVoiceViewEnabled(), isHomeVisible = isHomeVisible)
-            }
-            homeTileLongClickListener = object : HomeTileLongClickListener {
-                override fun onHomeTileLongClick(unpinTile: () -> Unit) {
-                    callbacks?.onHomeTileLongClick(unpinTile)
-                }
-            }
-        }
-
         touchExplorationStateChangeListener = BrowserTouchExplorationStateChangeListener(
-                layout.homeScreen, this::updateWebViewVisibility).also {
+            navigationOverlay, this::updateWebViewVisibility).also {
             layout.context.getAccessibilityManager().addTouchExplorationStateChangeListener(it)
         }
 
@@ -219,26 +202,32 @@ class BrowserFragment : IWebViewLifecycleFragment() {
 
     override fun onDestroyView() {
         super.onDestroyView()
-
         context?.getAccessibilityManager()?.removeTouchExplorationStateChangeListener(touchExplorationStateChangeListener)
         touchExplorationStateChangeListener = null
+    }
 
-        // Since we start the async jobs in View.init and Android is inflating the view for us,
-        // there's no good way to pass in the uiLifecycleJob. We could consider other solutions
-        // but it'll add complexity that I don't think is probably worth it.
-        homeScreen.uiLifecycleCancelJob.cancel(CancellationException("Parent lifecycle has ended"))
+    private fun setNavigationOverlayIsVisible(isVisible: Boolean, isHomescreenOnStartup: Boolean = false) {
+        callbacks?.onHomeVisibilityChange(isVisible, isHomescreenOnStartup = isHomescreenOnStartup)
+        // todo: only necessary on initial homescreen?
+        updateWebViewVisibility(isVoiceViewEnabled = context!!.isVoiceViewEnabled(), isNavigationOverlayVisible = isVisible)
+
+        if (isVisible) {
+            navigationOverlay.show(fragmentManager!!, "") // todo: tag
+        } else {
+            navigationOverlay.dismiss()
+        }
     }
 
     fun loadUrl(url: String) {
-        // Intents can trigger loadUrl, and we need to make sure the homescreen is always hidden.
-        homeScreen.setVisibilityWithAnimation(toShow = false)
+        // Intents can trigger loadUrl, and we need to make sure the navigation overlay is always hidden.
+        setNavigationOverlayIsVisible(false)
         val webView = webView
         if (webView != null && !TextUtils.isEmpty(url) && !URLS_BLOCKED_FROM_USERS.contains(url)) {
             webView.loadUrl(url)
         }
     }
 
-    private fun updateWebViewVisibility(isVoiceViewEnabled: Boolean, isHomeVisible: Boolean) {
+    private fun updateWebViewVisibility(isVoiceViewEnabled: Boolean, isNavigationOverlayVisible: Boolean) {
         // We want to disable accessibility on the WebView when the home screen is visible so users
         // cannot focus the WebView content below home tiles. Unfortunately, isFocusable* and
         // setImportantForAccessibility didn't work so the only way I could disable WebView
@@ -247,7 +236,7 @@ class BrowserFragment : IWebViewLifecycleFragment() {
         // display the home tiles over the partially visible, unfocusable WebView, invalidating the
         // hide-it-for-everyone approach so it seemed simpler to only hide the WebView for a11y users
         // in this simple place.
-        val isWebViewVisible = !isVoiceViewEnabled || !isHomeVisible
+        val isWebViewVisible = !isVoiceViewEnabled || !isNavigationOverlayVisible
         webView?.setVisibility(if (isWebViewVisible) View.VISIBLE else View.GONE)
     }
 
@@ -275,11 +264,11 @@ class BrowserFragment : IWebViewLifecycleFragment() {
 }
 
 private class BrowserTouchExplorationStateChangeListener(
-    private val homeScreen: HomeTileGridNavigation,
+    private val navigationOverlay: NavigationOverlayFragment,
     private val updateWebViewVisibility: (isVoiceViewEnabled: Boolean, isHomeVisible: Boolean) -> Unit
 ) : TouchExplorationStateChangeListener {
     override fun onTouchExplorationStateChanged(isVoiceViewEnabled: Boolean) { // touch exploration state = VoiceView
-        updateWebViewVisibility(isVoiceViewEnabled, homeScreen.isVisible)
+        updateWebViewVisibility(isVoiceViewEnabled, navigationOverlay.isVisible)
     }
 }
 
